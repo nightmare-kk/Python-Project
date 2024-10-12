@@ -2,25 +2,20 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from datasets import load_dataset
-from torchtext.data import Field, BucketIterator
-from transformers import BertModel, BertTokenizer
+from transformers import BertForSequenceClassification, BertTokenizer
 import random
-import loralib as lora
 import itertools
 import matplotlib.pyplot as plt
+import pickle
+from peft import get_peft_model, LoraConfig, TaskType
 
+# 设置随机种子
+SEED = 1234
+random.seed(SEED)
+torch.manual_seed(SEED)
 
-# 随机种子
-seed = 1234
-np.random.seed(seed)
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.backends.cudnn.deterministic = True
-
-
-# 导入数据
 # 加载IMDB数据集
-dataset = datasets.load_dataset("stanfordnlp/imdb")
+dataset = load_dataset('imdb')
 train_data = dataset['train']
 test_data = dataset['test']
 
@@ -31,38 +26,40 @@ def preprocess_data(data):
 train_data = preprocess_data(train_data)
 test_data = preprocess_data(test_data)
 
-print(train_data[0])
-
 # 创建BERT的tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
 # Tokenization
 def tokenize_data(data):
-    return [(tokenizer(text, padding='max_length', truncation=True, max_length=512, return_tensors='pt'), label) for text, label in data]
+    encodings = tokenizer([text for text, _ in data], padding=True, truncation=True, max_length=512, return_tensors='pt')
+    return [(encodings, label) for (_, label) in data]
 
 train_data = tokenize_data(train_data)
 test_data = tokenize_data(test_data)
 
 # 创建迭代器
-BATCH_SIZE = 16
-
+BATCH_SIZE = 2  # 减小批量大小
 
 # 定义BERT模型
 class BERTSentiment(nn.Module):
     def __init__(self, rank):
         super(BERTSentiment, self).__init__()
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
-        self.fc = nn.Linear(self.bert.config.hidden_size, 1)
-        self.sigmoid = nn.Sigmoid()
+        self.bert = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=1)
 
-        # LoRA适配
-        self.bert = lora.Lora(self.bert, rank=rank)
+        # LoRA配置
+        lora_config = LoraConfig(
+            r=rank,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            task_type=TaskType.SEQ_CLS
+        )
+
+        # 应用LoRA适配
+        self.bert = get_peft_model(self.bert, lora_config)
 
     def forward(self, input_ids, attention_mask):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        cls_output = outputs.last_hidden_state[:, 0, :]  # 取[CLS]的输出
-        return self.sigmoid(self.fc(cls_output))
-
+        return outputs.logits.squeeze(-1)  # 取最后的logits
 
 # 训练模型
 def train(model, data, optimizer, criterion):
@@ -70,8 +67,8 @@ def train(model, data, optimizer, criterion):
     epoch_loss = 0
 
     for input_data, label in data:
-        input_ids = input_data['input_ids'].squeeze(0).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-        attention_mask = input_data['attention_mask'].squeeze(0).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        input_ids = input_data['input_ids'].to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        attention_mask = input_data['attention_mask'].to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
         labels = torch.tensor(label).float().unsqueeze(0).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
         optimizer.zero_grad()
@@ -81,6 +78,9 @@ def train(model, data, optimizer, criterion):
         optimizer.step()
 
         epoch_loss += loss.item()
+
+        # 清理未使用的缓存
+        torch.cuda.empty_cache()
 
     return epoch_loss / len(data)
 
@@ -92,8 +92,8 @@ def evaluate(model, data, criterion):
 
     with torch.no_grad():
         for input_data, label in data:
-            input_ids = input_data['input_ids'].squeeze(0).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-            attention_mask = input_data['attention_mask'].squeeze(0).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+            input_ids = input_data['input_ids'].to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+            attention_mask = input_data['attention_mask'].to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
             labels = torch.tensor(label).float().unsqueeze(0).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
             predictions = model(input_ids, attention_mask)
@@ -111,6 +111,9 @@ def cross_validate(model_class, rank, lr, batch_size, n_folds=5):
     fold_size = len(train_data) // n_folds
     indices = list(range(len(train_data)))
     random.shuffle(indices)
+
+    train_losses = []
+    val_losses = []
 
     for fold in range(n_folds):
         print(f"Fold {fold + 1}/{n_folds}")
@@ -133,6 +136,9 @@ def cross_validate(model_class, rank, lr, batch_size, n_folds=5):
             train_loss = train(model, train_subset, optimizer, criterion)
             val_loss, val_accuracy = evaluate(model, val_subset, criterion)
 
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+
             print(f'Epoch: {epoch+1}, Train Loss: {train_loss:.3f}, Val Loss: {val_loss:.3f}, Val Accuracy: {val_accuracy:.3f}')
 
     # 绘制损失曲线
@@ -144,13 +150,14 @@ def cross_validate(model_class, rank, lr, batch_size, n_folds=5):
     plt.legend()
     plt.show()
 
-
+    # 返回最后一个验证损失
+    return val_losses[-1]
 
 # 网格搜索超参数
 def grid_search():
     ranks = [1, 4, 8, 16]
     lrs = [1e-5, 1e-4, 1e-3]
-    batch_sizes = [16, 32, 64]
+    batch_sizes = [8]  # 只使用一个批量大小，避免过多的组合
 
     best_val_loss = float('inf')
     best_params = None
@@ -159,11 +166,17 @@ def grid_search():
         print(f"Training with Rank: {rank}, Learning Rate: {lr}, Batch Size: {batch_size}")
         val_loss = cross_validate(BERTSentiment, rank, lr, batch_size)
 
+        # 这里可以根据验证集的最后一个损失来决定是否更新最佳参数
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_params = (rank, lr, batch_size)
 
+    # 保存最佳参数
+    with open('best_params.pkl', 'wb') as f:
+        pickle.dump(best_params, f)
+
     print("Best Parameters:", best_params)
+
 
 # 进行网格搜索
 grid_search()
