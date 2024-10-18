@@ -7,7 +7,7 @@
 
 数据集中用户ID为主键。该字段正负样本将统一处理为统一的格式，其中训练集中包含正负样本标识，测试集不包含正负样本标识，详细见下表：
 
-![Image text](https://github.com/nightmare-kk/Python-Project/blob/main/3.CMCC%20Customer%20Classification/Dataset.png)
+![Image text](https://github.com/nightmare-kk/Python-Project/blob/main/2.CMCC%20Customer%20Classification/Dataset.png)
 
 ## 3. 数据预处理
 - 数据清洗：删除缺失值、重复值、异常值
